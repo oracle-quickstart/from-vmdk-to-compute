@@ -1,0 +1,280 @@
+- hosts: localhost
+  vars:
+    # The bucket where we uplod the VMDK
+    v_bucket_name: bucket3
+
+    # the namespace of the object storage
+    v_namespace: orasenatdpltintegration03
+
+    # The path where the vmdks will be exported
+    v_path: for_import
+    # I will look for these kind of files
+    v_pattern: "*.vmdk"
+
+    hostname: "vcenter-testvmware.sddc.iad.oci.oraclecloud.com"
+    username: "administrator@vsphere.local"
+    password: ".......#"
+    datacenter: "oci01-w01-consolidated01"
+
+    # Windows machines related variables. These are only needed if RunWinTask: True
+    ansible_winrm_server_cert_validation: ignore
+    ansible_winrm_transport: basic
+    ansible_winrm_pass: ".........#"
+    ansible_winrm_user: opc
+    RunWinTasks: False
+
+  tasks:
+    ## VMWARE related
+    - name: Gather all registered virtual machines
+      vmware_vm_info:
+        hostname: "{{ hostname }}"
+        username: "{{ username }}"
+        password: "{{ password }}"
+        validate_certs: no
+      delegate_to: localhost
+      register: vminfo
+
+    - set_fact:
+        # to filter only some hosts based on their name
+        vm_list: "{% set vms = [] %}{% for x in vminfo.virtual_machines %}{{ vms.append(x.guest_name) }}{% endfor %}{{ vms }}"
+        # to filter only Windoes host
+        windows_vm_list: "{% set vms = [] %}{% for x in vminfo.virtual_machines %}{% if 'Windows' in x.guest_fullname %}{{ vms.append(x.guest_name) }}{% endif %}{% endfor %}{{ vms }}"
+
+        linux_vm_list: "{% set vms = [] %}{% for x in vminfo.virtual_machines %}{% if 'Windows' not in x.guest_fullname %}{{ vms.append(x.guest_name) }}{% endif %}{% endfor %}{{ vms }}"
+
+    ## Windows executed only when RunWinTasks is True ##################################
+    - name: Windows tasks
+      block:
+        - name: check if driver is installed
+          win_reg_stat:
+            path: HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\{45C24E22-C795-4D5B-942E-577B87558EAD}
+          delegate_to: "{{ item }}"
+          connection: winrm
+          #delegate_facts: true
+          loop: "{{ windows_vm_list }}"
+          register: driver_installed
+
+        - name: Copy agent zip
+          win_copy:
+            src: ./V984560-01.zip
+            dest: C:\Temp\
+          delegate_to: "{{ item }}"
+          connection: winrm
+          delegate_facts: true
+          loop: "{{ windows_vm_list }}"
+          when: "{% for i in driver_installed.results %}{% if i.exists == false %}{% endif %}{% endfor %}"
+
+        - name: Unzip the agent
+          win_unzip:
+            src: C:\Temp\V984560-01.zip
+            dest: C:\Temp\iodriver
+            creates: C:\Temp\iodriver
+          delegate_to: "{{ item }}"
+          connection: winrm
+          delegate_facts: true
+          loop: "{{ windows_vm_list }}"
+          when: "{% for i in driver_installed.results %}{% if i.exists == false %}{% endif %}{% endfor %}"
+
+        - name: Copy response file
+          win_copy:
+            src: ./setup.iss
+            dest: C:\Temp\iodriver\
+          delegate_to: "{{ item }}"
+          connection: winrm
+          delegate_facts: true
+          loop: "{{ windows_vm_list }}"
+          when: "{% for i in driver_installed.results %}{% if i.exists == false %}{% endif %}{% endfor %}"
+
+        - name: Install
+          win_package:
+            path: C:\Temp\iodriver\Setup.exe
+            product_id: "{45C24E22-C795-4D5B-942E-577B87558EAD}"
+            state: present
+            arguments: /S -f1c:\Temp\iodriver\setup.iss
+            validate_certs: no
+          delegate_to: "{{ item }}"
+          connection: winrm
+          delegate_facts: true
+          loop: "{{ windows_vm_list }}"
+          when: "{% for i in driver_installed.results %}{% if i.exists == false %}{% endif %}{% endfor %}"
+
+        - name: Gather facts about vm
+          vmware_guest_info:
+            hostname: "{{ hostname }}"
+            username: "{{ username }}"
+            password: "{{ password }}"
+            datacenter: "{{ datacenter }}"
+            name: "{{ item }}"
+            validate_certs: no
+          loop: "{{ vm_list }}"
+          delegate_to: localhost
+          register: moid_info
+
+        - name: Set the state of a virtual machine to poweroff
+          vmware_guest_powerstate:
+            validate_certs: no
+            hostname: "{{ hostname }}"
+            username: "{{ username }}"
+            password: "{{ password }}"
+            name: "{{ item.instance.hw_name }}"
+            state: powered-off
+          loop: "{{ moid_info.results }}"
+          async: 100000
+          poll: 0
+          register: power_off_details
+
+        - name: wait for power-off to finish
+          async_status:
+            jid: "{{ item.ansible_job_id }}"
+          loop: "{{ power_off_details.results }}"
+          until: poweroff_result.finished
+          retries: 10000
+          delay: 10
+          register: poweroff_result
+
+        - name: Export vmdk in loop
+          vmware_export_ovf:
+            validate_certs: no
+            hostname: "{{ hostname }}"
+            username: "{{ username }}"
+            password: "{{ password }}"
+            name: "{{ item.instance.hw_name }}"
+            export_with_images: false
+            #based on CPU and MEM we name the folder where we export the VM
+            export_dir: "{% if item.instance.hw_memtotal_mb <= 15360 and item.instance.hw_processor_count < 2 %}./{{ v_path }}/2.1{% elif item.instance.hw_memtotal_mb <= 30720 and item.instance.hw_processor_count < 3 %}./{{ v_path }}/2.2{% elif item.instance.hw_memtotal_mb <= 61440 and item.instance.hw_processor_count <= 4 %}./{{ v_path }}/2.4{% elif item.instance.hw_memtotal_mb <= 122880 and item.instance.hw_processor_count <= 8 %}./{{ v_path }}/2.8{% elif item.instance.hw_memtotal_mb <= 245760 and item.instance.hw_processor_count <= 16 %}./{{ v_path }}/2.16{% elif item.instance.hw_memtotal_mb > 245760 and item.instance.hw_processor_count > 16 %}./{{ v_path }}/2.24{% endif %}"
+          loop: "{{ moid_info.results }}"
+          async: 100000
+          poll: 0
+          register: export_info
+
+        - name: Wait for export vmdk to finish
+          async_status:
+            jid: "{{ item.ansible_job_id }}"
+          loop: "{{ export_info.results }}"
+          until: export_result.finished
+          retries: 10000
+          delay: 10
+          register: export_result
+
+        - name: Set the state of a virtual machine to poweron
+          vmware_guest_powerstate:
+            validate_certs: no
+            hostname: "{{ hostname }}"
+            username: "{{ username }}"
+            password: "{{ password }}"
+            name: "{{ item.instance.hw_name }}"
+            state: powered-on
+          loop: "{{ moid_info.results }}"
+          async: 100000
+          poll: 0
+          register: power_on_details
+
+      when: RunWinTasks | bool
+    ### End Windows #############################
+
+    ## Get only the Linux VMs ##################################
+    - name: Linux tasks
+      block:
+        - name: Gather facts about linux vm
+          vmware_guest_info:
+            hostname: "{{ hostname }}"
+            username: "{{ username }}"
+            password: "{{ password }}"
+            datacenter: "{{ datacenter }}"
+            name: "{{ item }}"
+            validate_certs: no
+          loop: "{{ linux_vm_list }}"
+          delegate_to: localhost
+          register: moid_info2
+
+        - name: Set the state of the linux virtual machines to poweroff
+          vmware_guest_powerstate:
+            validate_certs: no
+            hostname: "{{ hostname }}"
+            username: "{{ username }}"
+            password: "{{ password }}"
+            name: "{{ item.instance.hw_name }}"
+            state: powered-off
+          loop: "{{ moid_info2.results }}"
+          async: 100000
+          poll: 0
+          register: linux_power_off_details
+
+        - name: wait for linux power-off to finish
+          async_status:
+            jid: "{{ item.ansible_job_id }}"
+          loop: "{{ linux_power_off_details.results }}"
+          until: linux_poweroff_result.finished
+          retries: 10000
+          delay: 10
+          register: linux_poweroff_result
+
+        - name: Export linux vmdk in loop
+          vmware_export_ovf:
+            validate_certs: no
+            hostname: "{{ hostname }}"
+            username: "{{ username }}"
+            password: "{{ password }}"
+            name: "{{ item.instance.hw_name }}"
+            export_with_images: false
+            #based on CPU and MEM we name the folder where we export the VM
+            export_dir: "{% if item.instance.hw_memtotal_mb <= 15360 and item.instance.hw_processor_count < 2 %}./{{ v_path }}/2.1{% elif item.instance.hw_memtotal_mb <= 30720 and item.instance.hw_processor_count < 3 %}./{{ v_path }}/2.2{% elif item.instance.hw_memtotal_mb <= 122880 and item.instance.hw_processor_count <= 8 %}./{{ v_path }}/2.8{% elif item.instance.hw_memtotal_mb <= 245760 and item.instance.hw_processor_count <= 16 %}./{{ v_path }}/2.16{% elif item.instance.hw_memtotal_mb > 245760 and item.instance.hw_processor_count > 16 %}./{{ v_path }}/2.24{% endif %}"
+          loop: "{{ moid_info2.results }}"
+          async: 100000
+          poll: 0
+          register: linux_export_info
+
+        - name: Wait for export linux vmdk to finish
+          async_status:
+            jid: "{{ item.ansible_job_id }}"
+          loop: "{{ linux_export_info.results }}"
+          until: linux_export_result.finished
+          retries: 10000
+          delay: 10
+          register: linux_export_result
+
+        - name: Set the state of the linux virtual machine to poweron
+          vmware_guest_powerstate:
+            validate_certs: no
+            hostname: "{{ hostname }}"
+            username: "{{ username }}"
+            password: "{{ password }}"
+            name: "{{ item.instance.hw_name }}"
+            state: powered-on
+          loop: "{{ moid_info2.results }}"
+          async: 100000
+          poll: 0
+          register: linux_power_on_details
+
+      when: not RunWinTasks
+    ### End Linux #############################
+
+    ## Get the exported files
+    - name: Get the vmdk files
+      find:
+        paths: "{{ v_path }}"
+        recurse: yes
+        patterns: "{{ v_pattern }}"
+      register: vmdk_files
+
+    - name: VMDK's files found
+      debug:
+        msg: "{{ vmdk_files | json_query('files[*].path') }}"
+
+    - set_fact:
+        vmdk_files_path: "{{ vmdk_files | json_query('files[*].path') }}"
+
+    ## OCIrelated
+
+    - name: "Upload vmdk files to bucket {{ v_bucket_name }}"
+      oracle.oci.oci_object_storage_object:
+        namespace_name: "{{ v_namespace }}"
+        bucket_name: "{{ v_bucket_name }}"
+        state: present
+        object_name: "{{ ((item | basename).split('.')[0]) + '_' + item.split('/')[-3]  }}"
+        src: "{{ item }}"
+        force: false
+      async: 100000
+      poll: 0
+      register: obj_det
+      loop: "{{ vmdk_files_path }}"

@@ -1,0 +1,102 @@
+- hosts: localhost
+  tasks:
+    - name: Delete auth_token
+      oracle.oci.oci_identity_auth_token:
+        user_id: "{{ user_id }}"
+        auth_token_id: "{{ auth_token_id }}"
+        state: absent
+      register: deleted_auth_token
+
+    - name: Delete dynamic_group
+      oracle.oci.oci_identity_dynamic_group:
+        dynamic_group_id: "{{ dynamic_group_id }}"
+        state: absent
+      register: deleted_dg
+
+    - name: Delete policy for dynamic group
+      oracle.oci.oci_identity_policy:
+        policy_id: "{{ policy_id }}"
+        state: absent
+      register: policy_details
+
+    - name: Delete convert function
+      oracle.oci.oci_functions_function:
+        function_id: "{{ convert_func_id }}"
+        state: absent
+      register: deleted_conv_func
+
+    - name: Delete deploy instance function
+      oracle.oci.oci_functions_function:
+        function_id: "{{ deploy_instance_func_id }}"
+        state: absent
+      register: deleted_conv_func
+
+    - name: Delete application
+      oracle.oci.oci_functions_application:
+        application_id: "{{ application_id }}"
+        state: absent
+      register: deleted_app
+
+    - name: Get details about the user
+      oracle.oci.oci_identity_user_facts:
+        # required
+        user_id: "{{ user_id }}"
+      register: user_details
+
+    - name: List conv image
+      oracle.oci.oci_artifacts_container_image_facts:
+        compartment_id: "{{ user_details.users[0].compartment_id }}"
+        compartment_id_in_subtree: true
+        repository_name: "{{ repository_name + '/' + convert_docker_image }}"
+        sort_by: TIMECREATED
+        sort_order: ASC
+      register: conv_img_details
+
+    - name: List deploy instance image
+      oracle.oci.oci_artifacts_container_image_facts:
+        compartment_id: "{{ user_details.users[0].compartment_id }}"
+        compartment_id_in_subtree: true
+        repository_name: "{{ repository_name + '/' + create_instance_docker_image }}"
+        sort_by: TIMECREATED
+        sort_order: ASC
+      register: deploy_inst_img_details
+
+    - name: Delete container_repository
+      oracle.oci.oci_artifacts_container_repository:
+        repository_id: "{{ repository_id }}"
+        state: absent
+      register: deleted_repo
+
+    - name: Delete container_repo for convert from root
+      oracle.oci.oci_artifacts_container_repository:
+        repository_id: "{{ conv_img_details.container_images[0].repository_id }}"
+        state: absent
+
+    - name: Delete container_repo for deploy instance from root
+      oracle.oci.oci_artifacts_container_repository:
+        repository_id: "{{ deploy_inst_img_details.container_images[0].repository_id }}"
+        state: absent
+
+    - name: Delete rule for convert
+      oracle.oci.oci_events_rule:
+        rule_id: "{{ convert_rule_id }}"
+        state: absent
+      register: deleted_convert_rule
+
+    - name: Delete rule for deploying instances
+      oracle.oci.oci_events_rule:
+        rule_id: "{{ deploy_instance_rule_id }}"
+        state: absent
+      register: deleted_convert_rule
+
+    - name: ORACLE remove from inventory
+      shell: |
+        sed -i '/auth_token_id/d' inventory_setup.ini
+        sed -i '/dynamic_group_id/d' inventory_setup.ini
+        sed -i '/policy_id/d' inventory_setup.ini
+        sed -i '/convert_func_id/d' inventory_setup.ini
+        sed -i '/deploy_instance_func_id/d' inventory_setup.ini
+        sed -i '/application_id/d' inventory_setup.ini
+        sed -i '/convert_rule_id/d' inventory_setup.ini
+        sed -i '/deploy_instance_rule_id/d' inventory_setup.ini
+        sed -i '/repository_id/d' inventory_setup.ini

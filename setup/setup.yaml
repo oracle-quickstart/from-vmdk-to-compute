@@ -1,0 +1,176 @@
+- hosts: localhost
+
+  tasks:
+    - name: Get details about the user
+      oracle.oci.oci_identity_user_facts:
+        # required
+        user_id: "{{ user_id }}"
+      register: user_details
+
+    - name: Get tenancy details
+      oracle.oci.oci_identity_tenancy_facts:
+        tenancy_id: "{{ user_details.users[0].compartment_id }}"
+      register: tenancy_details
+
+    - name: Get region details
+      oracle.oci.oci_identity_region_facts:
+        name: "{{ region }}"
+      register: region_details
+
+    - name: List auth_tokens
+      oracle.oci.oci_identity_auth_token_facts:
+        # required
+        user_id: "{{ user_id }}"
+      register: list_tokens
+
+    - set_fact:
+        see_if_exists: "{% set token_list = [] %}{% for i in list_tokens.auth_tokens %}{% if i.description == 'test_token_for_vmdk_migration' %}{{ token_list.append(i.description) }}{% endif %}{% endfor %}{{ token_list }}"
+
+    - name: Delete auth_token if exists
+      oracle.oci.oci_identity_auth_token:
+        # required
+        description: "test_token_for_vmdk_migration"
+        user_id: "{{ user_id }}"
+        auth_token_id: "{% for i in list_tokens.auth_tokens %}{% if i.description == 'test_token_for_vmdk_migration' %}{{ i.id }}{% endif %}{% endfor %}"
+        state: absent
+      when: see_if_exists | length > 0
+      register: updated_auth_token
+
+    - name: Create auth_token
+      oracle.oci.oci_identity_auth_token:
+        # required
+        description: "test_token_for_vmdk_migration"
+        user_id: "{{ user_id }}"
+        state: present
+
+      register: auth_token
+
+    - name: Create dynamic_group
+      oracle.oci.oci_identity_dynamic_group:
+        compartment_id: "{{ user_details.users[0].compartment_id }}"
+        name: "FuncServiceDG"
+        matching_rule: "ALL {resource.type='fnfunc', resource.compartment.id='{{ compartment }}', instance.compartment.id='{{ compartment }}'}"
+        description: "DG for fn service "
+      register: dg_details
+
+    - name: Get the compartment name
+      oracle.oci.oci_identity_compartment_facts:
+        compartment_id: "{{ compartment }}"
+      register: comp_details
+
+    - name: Create policy for dynamic group
+      oracle.oci.oci_identity_policy:
+        compartment_id: "{{ compartment }}"
+        name: "FuncServiceDG_Policy"
+        statements:
+          [
+            "Allow dynamic-group {{ dg_details.dynamic_group.name }} to read object-family in compartment {{ comp_details.compartments[0].name }}",
+            "Allow dynamic-group {{ dg_details.dynamic_group.name }} to manage instance-family in compartment {{ comp_details.compartments[0].name }}",
+          ]
+        description: "Allows functions to run as resource principal in compartment {{ comp_details.compartments[0].name }}"
+      register: policy_details
+
+    - name: Log into private registry and force re-authorization
+      docker_login:
+        registry: "{{ region_details.regions[0].key | lower + '.ocir.io' }}"
+        username: "{{ tenancy_details.tenancy.name + '/' + user_details.users[0].name }}"
+        password: "{{ auth_token.auth_token.token }}"
+        reauthorize: yes
+      register: docker_login
+      retries: 12
+      delay: 10
+      until: docker_login is not failed
+
+    - name: Create container_repository
+      oracle.oci.oci_artifacts_container_repository:
+        # required
+        compartment_id: "{{ compartment }}"
+        display_name: "{{ repository_name }}"
+      register: repo_details
+
+    - name: Build the convert docker image and push to repo
+      docker_image:
+        build:
+          path: "{{ convert_image_path }}"
+        name: "{{ region_details.regions[0].key | lower + '.ocir.io' + '/' + tenancy_details.tenancy.name + '/' + repo_details.container_repository.display_name + '/' + convert_docker_image }}"
+        tag: "{{ tag_build }}"
+        push: yes
+        source: build
+      register: convert_image_details
+
+    - name: Build the create instance docker image and push to repo
+      docker_image:
+        build:
+          path: "{{ create_instance_image_path }}"
+        name: "{{ region_details.regions[0].key | lower + '.ocir.io' + '/' + tenancy_details.tenancy.name + '/' + repo_details.container_repository.display_name + '/' + create_instance_docker_image }}"
+        tag: "{{ tag_build }}"
+        push: yes
+        source: build
+      register: create_instance_image_details
+
+    - name: Create application
+      oracle.oci.oci_functions_application:
+        # required
+        compartment_id: "{{ compartment }}"
+        display_name: "{{ app_name }}"
+        subnet_ids: ["{{ app_subnet_id }}"]
+      register: app_facts
+
+    - name: Create convert function
+      oracle.oci.oci_functions_function:
+        # required
+        display_name: "{{ func_convert_vmdk }}"
+        application_id: "{{ app_facts.application.id }}"
+        image: "{{ region_details.regions[0].key | lower + '.ocir.io' + '/' + tenancy_details.tenancy.name + '/' + repository_name + '/' + convert_docker_image + ':' + tag_build }}"
+        memory_in_mbs: 256
+      register: func1_facts
+
+    - name: Create deploy instance function
+      oracle.oci.oci_functions_function:
+        # required
+        display_name: "{{ func_create_instance }}"
+        application_id: "{{ app_facts.application.id }}"
+        image: "{{ region_details.regions[0].key | lower + '.ocir.io' + '/' + tenancy_details.tenancy.name + '/' + repository_name + '/' + create_instance_docker_image + ':' + tag_build }}"
+        config: '{"p_shapes": "{\"shapes\":{ \"2.1\":\"VM.Standard2.1\", \"2.2\":\"VM.Standard2.2\", \"2.4\":\"VM.Standard2.4\", \"2.8\":\"VM.Standard2.8\", \"2.16\":\"VM.Standard2.16\", \"2.24\":\"VM.Standard2.24\" } }", "instances_subnet": "{{ instances_subnet_id }}", "assign_public_ip": "{{ assign_pub_ip }}"}'
+        memory_in_mbs: 256
+      register: func2_facts
+
+    - name: Create rule for convert
+      oracle.oci.oci_events_rule:
+        display_name: "tst_rule_conv"
+        is_enabled: true
+        compartment_id: "{{ compartment }}"
+        actions:
+          actions:
+            - action_type: FAAS
+              is_enabled: true
+              function_id: "{{ func1_facts.function.id }}"
+              description: "Event rule to convert vmdk into custom image when uploaded into bucket"
+        condition: ' {"eventType": ["com.oraclecloud.objectstorage.createobject", "com.oraclecloud.objectstorage.updatebucket"], "data":{"additionalDetails": {"bucketName": ["{{ bucket_name }}"]}}}'
+      register: convert_rule_details
+
+    - name: Create rule for deploy instance
+      oracle.oci.oci_events_rule:
+        display_name: "tst_rule_dpl_inst"
+        is_enabled: true
+        compartment_id: "{{ compartment }}"
+        actions:
+          actions:
+            - action_type: FAAS
+              is_enabled: true
+              function_id: "{{ func2_facts.function.id }}"
+              description: "Event rule to deploy instance when a custom image is created"
+        condition: '{"eventType": ["com.oraclecloud.computeapi.createimage.end"],"data":{}}'
+      register: deploy_instance_rule_details
+
+    - name: Write inventory_setup.ini
+      shell: |
+        echo auth_token_id={{ auth_token.auth_token.id }} >> inventory_setup.ini
+        echo application_id={{ app_facts.application.id }} >> inventory_setup.ini
+        echo convert_func_id={{ func1_facts.function.id }} >> inventory_setup.ini
+        echo deploy_instance_func_id={{ func2_facts.function.id }} >> inventory_setup.ini
+        echo repository_id={{ repo_details.container_repository.id }} >> inventory_setup.ini
+        echo convert_rule_id={{ convert_rule_details.rule.id }} >> inventory_setup.ini
+        echo deploy_instance_rule_id={{ deploy_instance_rule_details.rule.id }} >> inventory_setup.ini
+        echo policy_id={{ policy_details.policy.id }} >> inventory_setup.ini
+        echo dynamic_group_id={{ dg_details.dynamic_group.id }} >> inventory_setup.ini
