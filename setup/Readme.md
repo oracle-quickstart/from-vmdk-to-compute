@@ -111,8 +111,8 @@ You will have to set the values for the following variables:
 
 - Token
 
-In case you already have 2 token created the setup will raise an error as you can only have 2 token per user
+In case you already have 2 tokens created the setup will raise an error as you can only have 2 tokens per user
 
-After the token is created it's takes a few moments until will be ready to use so you might
-see the play-book re-trying to connect to OCI Container registry a few times.
-By default it's tryies 12 times
+After the token is created it takes a few moments until it will be ready to use so you might
+see the playbook retrying to connect to OCI Container registry a few times.
+By default it tryies 12 times.
